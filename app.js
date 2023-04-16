@@ -39,11 +39,24 @@ window.onload = () => {
 
     const blob = new Blob(recordedChunks, { type: 'audio/wav' });
     const audioBuffer = await blob.arrayBuffer();
-    console.log(audioBuffer);
-
-    const offlineAudioContext = new OfflineAudioContext(1, audioBuffer.byteLength, audioContext.sampleRate);
-    const sourceBuffer = offlineAudioContext.createBuffer(1, audioBuffer.byteLength, offlineAudioContext.sampleRate);
-    sourceBuffer.copyToChannel(new Float32Array(audioBuffer), 0);
+    const audioData = await audioContext.decodeAudioData(audioBuffer);
+    
+    const offlineAudioContext = new OfflineAudioContext(
+      audioData.numberOfChannels,
+      audioData.length,
+      audioData.sampleRate
+    );
+    
+    const sourceBuffer = offlineAudioContext.createBuffer(
+      audioData.numberOfChannels,
+      audioData.length,
+      audioData.sampleRate
+    );
+    
+    for (let i = 0; i < audioData.numberOfChannels; i++) {
+      sourceBuffer.copyToChannel(audioData.getChannelData(i), i);
+    }
+    
 
     rnnoiseWorker = new Worker(new URL('./rnnoise-worker.js', import.meta.url), { type: 'module' });
     rnnoiseWorker.postMessage({ type: 'init' });
