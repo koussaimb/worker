@@ -1,11 +1,10 @@
-// import Recorder from './recorder.js';
-
 window.onload = () => {
   const startButton = document.getElementById('start');
   const stopButton = document.getElementById('stop');
   const downloadLink = document.getElementById('download');
 
-  let audioContext, source, processor, rnnoiseWorker, recorder;
+  let audioContext, source, processor, rnnoiseWorker, mediaRecorder, recordingStream, recordedChunks = [];
+  const bufferSize = 8192; // Define bufferSize outside event listeners
 
   startButton.addEventListener('click', async () => {
     console.log('Bouton démarrer cliqué');
@@ -17,54 +16,111 @@ window.onload = () => {
     audioContext = new AudioContext();
     source = audioContext.createMediaStreamSource(stream);
 
-    const bufferSize = 8192;
-    processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+    recordingStream = new MediaStream();
+    recordingStream.addTrack(stream.getAudioTracks()[0]);
+    mediaRecorder = new MediaRecorder(recordingStream);
+    mediaRecorder.start();
 
-    rnnoiseWorker = new Worker(new URL('./rnnoise-worker.js', import.meta.url), { type: 'module' });
-    rnnoiseWorker.postMessage({ type: 'init' });
-
-    rnnoiseWorker.onmessage = (event) => {
-      if (event.data.type === 'initialized') {
-        console.log('RNNoise worker initialized');
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        recordedChunks.push(event.data);
       }
     };
-
-    processor.onaudioprocess = (event) => {
-      const input = event.inputBuffer.getChannelData(0);
-      const output = event.outputBuffer.getChannelData(0);
-
-      rnnoiseWorker.postMessage({ type: 'process', input });
-      rnnoiseWorker.onmessage = (event) => {
-        if (event.data.type === 'processed') {
-          output.set(event.data.output);
-        }
-      };
-    };
-
-    source.connect(processor);
-    processor.connect(audioContext.destination);
-
-    // recorder = new Recorder(processor, { numChannels: 1 });
-    // recorder.record();
   });
 
-  stopButton.addEventListener('click', () => {
+  stopButton.addEventListener('click', async () => {
     console.log('Bouton arrêter cliqué');
     startButton.disabled = false;
     stopButton.disabled = true;
 
     source.disconnect();
-    processor.disconnect();
     audioContext.close();
+    mediaRecorder.stop();
 
-    recorder.stop();
+    const blob = new Blob(recordedChunks, { type: 'audio/wav' });
+    const audioBuffer = await blob.arrayBuffer();
+    console.log(audioBuffer);
 
-    recorder.exportWAV((blob) => {
-      const url = URL.createObjectURL(blob);
-      downloadLink.href = url;
-      downloadLink.style.display = 'inline';
-    });
+    const offlineAudioContext = new OfflineAudioContext(1, audioBuffer.byteLength, audioContext.sampleRate);
+    const sourceBuffer = offlineAudioContext.createBuffer(1, audioBuffer.byteLength, offlineAudioContext.sampleRate);
+    sourceBuffer.copyToChannel(new Float32Array(audioBuffer), 0);
 
-    recorder.clear();
+    rnnoiseWorker = new Worker(new URL('./rnnoise-worker.js', import.meta.url), { type: 'module' });
+    rnnoiseWorker.postMessage({ type: 'init' });
+
+    rnnoiseWorker.onmessage = (event) => {
+      if (event.data.type === 'INIT') {
+        console.log('RNNoise worker initialized');
+        rnnoiseWorker.postMessage({ type: 'process', input: sourceBuffer.getChannelData(0) });
+      } else if (event.data.type === 'RESULT') {
+        console.log('Processed audio frame:', event.data.payload);
+
+        const outputBuffer = new Float32Array(event.data.payload);
+        sourceBuffer.copyToChannel(outputBuffer, 0);
+
+        const offlineSource = offlineAudioContext.createBufferSource();
+        offlineSource.buffer = sourceBuffer;
+
+        offlineSource.connect(offlineAudioContext.destination);
+        offlineSource.start(0);
+
+        offlineAudioContext.startRendering().then(renderedBuffer => {
+          const audioBlob = new Blob([bufferToWave(renderedBuffer, 0, renderedBuffer.length)], { type: 'audio/wav' });
+          const url = URL.createObjectURL(audioBlob);
+          downloadLink.href = url;
+          downloadLink.style.display = 'inline';
+        });
+      }
+    };
   });
-};
+
+  function bufferToWave(abuffer, offset, len) {
+    let numOfChan = abuffer.numberOfChannels;
+    let length = len * numOfChan * 2 + 44;
+    let buffer = new ArrayBuffer(length);
+    let view = new DataView(buffer);
+    let channels = [];
+    let i;
+    let sample;
+    let pos = 0;
+
+    for (i = 0; i < numOfChan; i++) {
+      channels.push(abuffer.getChannelData(i));
+    }
+
+    setUint32(0, 0x52494646); // "RIFF"
+    setUint32(4, length - 8); // file length -
+  setUint32(8, 0x57415645); // "WAVE"
+
+  setUint32(12, 0x666d7420); // "fmt " chunk
+  setUint32(16, 16); // length = 16
+  setUint16(20, 1); // PCM format
+  setUint16(22, numOfChan);
+  setUint32(24, abuffer.sampleRate);
+  setUint32(28, abuffer.sampleRate * 2 * numOfChan); // avg bytes/sec
+  setUint16(32, numOfChan * 2); // block-align
+  setUint16(34, 16); // 16-bit
+
+  setUint32(36, 0x64617461); // "data" - chunk
+  setUint32(40, length - pos - 44); // chunk length
+
+  for (i = 0; i < len; i++) {
+    for (let channel = 0; channel < numOfChan; channel++) {
+      sample = Math.max(-1, Math.min(1, channels[channel][i + offset]));
+      sample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      view.setInt16(pos + channel * 2, sample, true);
+    }
+    pos += numOfChan * 2;
+  }
+
+  function setUint16(pos, val) {
+    view.setUint16(pos, val, true);
+  }
+
+  function setUint32(pos, val) {
+    view.setUint32(pos, val, true);
+  }
+
+  return buffer;
+}
+}
